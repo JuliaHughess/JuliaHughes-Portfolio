@@ -1,0 +1,5 @@
+Designed and implemented a microcontroller-based pattern memory game using the ATmega328P, leveraging hardware timers and interrupt-driven input handling to achieve precise timing and responsive user interaction
+Developed embedded C firmware using a structured state machine architecture to control LED sequencing, game-state transitions, and adaptive difficulty scaling, with fully non-blocking timing logic
+Implemented efficient input handling via hardware interrupts and software debouncing, ensuring reliable multi-button detection under real-time constraints
+Designed and prototyped the full hardware system, including LED driver circuits, pushbutton input circuitry, speaker output, and power distribution on a custom PCB
+Performed system-level debugging and hardware bring-up, identifying and resolving timing issues, signal inconsistencies, and input detection edge cases
