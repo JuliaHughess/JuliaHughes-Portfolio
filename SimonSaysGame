@@ -1,5 +1,607 @@
-Designed and implemented a microcontroller-based pattern memory game using the ATmega328P, leveraging hardware timers and interrupt-driven input handling to achieve precise timing and responsive user interaction
-Developed embedded C firmware using a structured state machine architecture to control LED sequencing, game-state transitions, and adaptive difficulty scaling, with fully non-blocking timing logic
-Implemented efficient input handling via hardware interrupts and software debouncing, ensuring reliable multi-button detection under real-time constraints
-Designed and prototyped the full hardware system, including LED driver circuits, pushbutton input circuitry, speaker output, and power distribution on a custom PCB
-Performed system-level debugging and hardware bring-up, identifying and resolving timing issues, signal inconsistencies, and input detection edge cases
+#include <Arduino.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+
+
+// Hardware mapping
+
+// D2      = PD2 = shared interrupt input from OR-gate output
+// D3      = PD3 = speaker
+// D4..D7  = PD4..PD7 = LEDs
+// D8..D11 = PB0..PB3 = button identity inputs (PULLDOWN wiring)
+//
+// Button numbering in this version:
+// D8  = button 0
+// D9  = button 1
+// D10 = button 2
+// D11 = button 3
+
+
+
+// Shared timebase / ISR variables
+volatile unsigned long tickMs = 0;
+
+// Speaker engine
+volatile bool speakerActive = false;
+volatile bool speakerLevel = false;
+volatile unsigned int speakerHalfPeriodMs = 2;
+volatile unsigned int speakerToggleCountdown = 2;
+volatile unsigned long speakerStopTick = 0;
+
+// Button engine
+volatile uint8_t buttonStableMask = 0x00;
+volatile bool debounceActive = false;
+volatile unsigned long debounceDeadline = 0;
+volatile uint8_t buttonSnapshot = 0x00;
+
+volatile bool buttonPressPending = false;
+volatile int8_t buttonPressed = -1;
+
+
+// Game data
+int pattern[10];
+int level = 1;
+int inputIndex = 0;
+
+
+// Timing constants
+const unsigned long STEP_ON = 550;
+const unsigned long STEP_GAP = 300;
+const unsigned long START_PAUSE = 800;
+const uint8_t DEBOUNCE = 40;
+const unsigned long INPUT_TIMEOUT = 5000;
+const unsigned long BUTTON_LED_ON = 120;
+
+
+// Pattern display state
+bool showingPattern = true;
+int showIndex = 0;
+bool showOn = false;
+unsigned long nextTime = 0;
+
+
+// Input state
+unsigned long inputDeadline = 0;
+bool waitingForRelease = false;
+
+
+// Short button LED flash state
+bool buttonLedActive = false;
+unsigned long buttonLedOffTime = 0;
+
+
+// Pending transitions
+bool pendingLevelAdvance = false;
+bool pendingResetToLevel1 = false;
+
+
+// Start screen state
+bool gameStarted = false;
+bool startPromptPrinted = false;
+
+
+// Sound sequence engine
+const int MAX_SOUND_STEPS = 6;
+unsigned int soundPeriods[MAX_SOUND_STEPS];
+unsigned int soundDurations[MAX_SOUND_STEPS];
+unsigned int soundGaps[MAX_SOUND_STEPS];
+int soundLength = 0;
+int soundIndex = -1;
+bool soundNotePlaying = false;
+unsigned long soundNextTime = 0;
+
+
+// Atomic time helper
+unsigned long nowMs() {
+  unsigned long t;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    t = tickMs;
+  }
+  return t;
+}
+
+
+// Direct port helpers
+inline void speakerHigh() {
+  PORTD |= (1 << PD3);
+}
+
+inline void speakerLow() {
+  PORTD &= ~(1 << PD3);
+}
+
+inline void allLedsOff() {
+  PORTD &= ~0b11110000;
+}
+
+inline void setOnlyLed(int idx) {
+  uint8_t ledMask = (1 << (PD4 + idx));
+  PORTD = (PORTD & ~0b11110000) | ledMask;
+}
+
+
+// Button decoding
+// D8  = PB0 = button 0
+// D9  = PB1 = button 1
+// D10 = PB2 = button 2
+// D11 = PB3 = button 3
+
+inline int8_t decodeSingleButton(uint8_t lowNibble) {
+  switch (lowNibble & 0x0F) {
+    case 0b0000: return -1; // none
+    case 0b0001: return 0;  // D8
+    case 0b0010: return 1;  // D9
+    case 0b0100: return 2;  // D10
+    case 0b1000: return 3;  // D11
+    default:     return -2; // multiple / invalid
+  }
+}
+
+
+// Timer1 setup: 1 ms tick
+// 16 MHz / 64 = 250 kHz
+// OCR1A = 249 -> 250 counts -> 1 ms
+
+void setupTimer1() {
+  cli();
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+
+  TCCR1B |= (1 << WGM12);              // CTC mode
+  TCCR1B |= (1 << CS11) | (1 << CS10); // prescaler 64
+  OCR1A = 249;                         // 1 ms interrupt
+
+  TIMSK1 |= (1 << OCIE1A);
+
+  sei();
+}
+
+
+// External interrupt setup for D2 / INT0
+// Shared interrupt line from OR-gate output
+// Trigger on rising edge only
+
+void setupButtonInterrupt() {
+  cli();
+
+  EICRA &= ~((1 << ISC01) | (1 << ISC00));
+  EICRA |= (1 << ISC01) | (1 << ISC00); // rising edge on INT0
+  EIFR  |= (1 << INTF0);                // clear pending flag
+  EIMSK |= (1 << INT0);                 // enable INT0
+
+  sei();
+}
+
+
+// TIMER ISR
+// Handles:
+// - system tick
+// - speaker toggling
+// - debounce completion
+
+ISR(TIMER1_COMPA_vect) {
+  tickMs++;
+
+  if (speakerActive) {
+    if (tickMs >= speakerStopTick) {
+      speakerActive = false;
+      speakerLevel = false;
+      speakerLow();
+    } else {
+      if (speakerToggleCountdown > 0) {
+        speakerToggleCountdown--;
+      }
+
+      if (speakerToggleCountdown == 0) {
+        speakerLevel = !speakerLevel;
+
+        if (speakerLevel) {
+          speakerHigh();
+        } else {
+          speakerLow();
+        }
+
+        speakerToggleCountdown = speakerHalfPeriodMs;
+      }
+    }
+  }
+
+  if (debounceActive && tickMs >= debounceDeadline) {
+    uint8_t rawButtons = PINB & 0x0F;
+    uint8_t oldStable = buttonStableMask;
+
+    debounceActive = false;
+
+    if (rawButtons == buttonSnapshot && rawButtons != buttonStableMask) {
+      buttonStableMask = rawButtons;
+
+      if (oldStable == 0x00) {
+        int8_t b = decodeSingleButton(rawButtons);
+
+        if (b >= 0 && !buttonPressPending) {
+          buttonPressed = b;
+          buttonPressPending = true;
+        }
+      }
+    }
+  }
+}
+
+
+// Shared button interrupt from OR gate on D2
+// Keep this ISR short
+
+ISR(INT0_vect) {
+  if (!debounceActive) {
+    buttonSnapshot = PINB & 0x0F;
+    debounceDeadline = tickMs + DEBOUNCE;
+    debounceActive = true;
+  }
+}
+
+
+// Speaker helpers
+
+void startBeep(unsigned int halfPeriodMs, unsigned long durationMs) {
+  unsigned long now = nowMs();
+
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    speakerHalfPeriodMs = halfPeriodMs;
+    speakerToggleCountdown = halfPeriodMs;
+    speakerStopTick = now + durationMs;
+    speakerActive = true;
+    speakerLevel = false;
+    speakerLow();
+  }
+}
+
+void stopBeep() {
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    speakerActive = false;
+    speakerLevel = false;
+    speakerLow();
+  }
+}
+
+
+// Sound sequence engine
+
+void startSoundSequence(int len,
+                        const unsigned int *periods,
+                        const unsigned int *durations,
+                        const unsigned int *gaps) {
+  soundLength = len;
+
+  for (int i = 0; i < len; i++) {
+    soundPeriods[i] = periods[i];
+    soundDurations[i] = durations[i];
+    soundGaps[i] = gaps[i];
+  }
+
+  soundIndex = 0;
+  soundNotePlaying = false;
+  soundNextTime = nowMs();
+}
+
+void playSingleTone(unsigned int period, unsigned int duration) {
+  unsigned int p[1] = {period};
+  unsigned int d[1] = {duration};
+  unsigned int g[1] = {0};
+  startSoundSequence(1, p, d, g);
+}
+
+void updateSoundSequence() {
+  if (soundIndex < 0 || soundIndex >= soundLength) return;
+
+  unsigned long now = nowMs();
+  if (now < soundNextTime) return;
+
+  if (!soundNotePlaying) {
+    startBeep(soundPeriods[soundIndex], soundDurations[soundIndex]);
+    soundNotePlaying = true;
+    soundNextTime = now + soundDurations[soundIndex];
+  } else {
+    stopBeep();
+    soundNotePlaying = false;
+    soundNextTime = now + soundGaps[soundIndex];
+    soundIndex++;
+
+    if (soundIndex >= soundLength) {
+      soundIndex = -1;
+    }
+  }
+}
+
+bool soundBusy() {
+  bool active;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    active = speakerActive;
+  }
+  return active || (soundIndex != -1);
+}
+
+
+// Sound presets
+void playButtonSound(int b) {
+  static const unsigned int periods[4] = {4, 3, 2, 1};
+  playSingleTone(periods[b], 120);
+}
+
+void playWrongSound() {
+  unsigned int p[2] = {3, 4};
+  unsigned int d[2] = {180, 260};
+  unsigned int g[2] = {60, 0};
+  startSoundSequence(2, p, d, g);
+}
+
+void playTimeoutSound() {
+  unsigned int p[3] = {2, 3, 4};
+  unsigned int d[3] = {140, 180, 240};
+  unsigned int g[3] = {40, 40, 0};
+  startSoundSequence(3, p, d, g);
+}
+
+void playLevelUpSound() {
+  unsigned int p[2] = {3, 1};
+  unsigned int d[2] = {120, 140};
+  unsigned int g[2] = {30, 0};
+  startSoundSequence(2, p, d, g);
+}
+
+void playStartSound() {
+  unsigned int p[3] = {4, 3, 2};
+  unsigned int d[3] = {100, 100, 140};
+  unsigned int g[3] = {30, 30, 0};
+  startSoundSequence(3, p, d, g);
+}
+
+// Pattern helpers
+void generatePattern() {
+  randomSeed(analogRead(A0));
+  for (int i = 0; i < 10; i++) {
+    pattern[i] = random(0, 4);
+  }
+}
+
+void clearInputState() {
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    buttonPressPending = false;
+    buttonPressed = -1;
+  }
+
+  waitingForRelease = false;
+}
+
+void startShowPattern() {
+  showingPattern = true;
+  showIndex = 0;
+  showOn = false;
+  allLedsOff();
+  nextTime = nowMs() + START_PAUSE;
+
+  buttonLedActive = false;
+  pendingLevelAdvance = false;
+  pendingResetToLevel1 = false;
+  clearInputState();
+}
+
+void startInputPhase() {
+  showingPattern = false;
+  allLedsOff();
+  inputIndex = 0;
+  inputDeadline = nowMs() + INPUT_TIMEOUT;
+
+  buttonLedActive = false;
+  clearInputState();
+}
+
+void beginGame() {
+  generatePattern();
+  level = 1;
+  inputIndex = 0;
+  pendingLevelAdvance = false;
+  pendingResetToLevel1 = false;
+  buttonLedActive = false;
+  clearInputState();
+
+  gameStarted = true;
+  waitingForRelease = true;
+  playStartSound();
+  Serial.println("Game started!");
+  startShowPattern();
+}
+
+// Pattern showing
+void showPatternStep() {
+  unsigned long now = nowMs();
+  if (now < nextTime) return;
+
+  int step = pattern[showIndex];
+
+  if (!showOn) {
+    setOnlyLed(step);
+
+    static const unsigned int periods[4] = {4, 3, 2, 1};
+    playSingleTone(periods[step], STEP_ON - 30);
+
+    showOn = true;
+    nextTime = now + STEP_ON;
+  } else {
+    allLedsOff();
+
+    showOn = false;
+    showIndex++;
+    nextTime = now + STEP_GAP;
+
+    if (showIndex >= level) {
+      startInputPhase();
+    }
+  }
+}
+
+
+// Input handling
+void handleButtonPress(int b) {
+  setOnlyLed(b);
+  buttonLedActive = true;
+  buttonLedOffTime = nowMs() + BUTTON_LED_ON;
+
+  int expected = pattern[inputIndex];
+
+  if (b == expected) {
+    inputIndex++;
+    inputDeadline = nowMs() + INPUT_TIMEOUT;
+
+    if (inputIndex >= level) {
+      playLevelUpSound();
+      pendingLevelAdvance = true;
+    } else {
+      playButtonSound(b);
+    }
+  } else {
+    playWrongSound();
+    pendingResetToLevel1 = true;
+  }
+}
+
+
+// Button processing
+void processButtons() {
+  if (showingPattern) return;
+
+  if (waitingForRelease) {
+    uint8_t rawButtons = PINB & 0x0F;
+
+    if ((rawButtons & 0x0F) == 0x00) {
+      ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        buttonStableMask = 0x00;
+      }
+      waitingForRelease = false;
+    }
+    return;
+  }
+
+  bool havePress = false;
+  int8_t pressedButton = -1;
+
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (buttonPressPending) {
+      havePress = true;
+      pressedButton = buttonPressed;
+      buttonPressPending = false;
+    }
+  }
+
+  if (havePress && pressedButton >= 0) {
+    handleButtonPress(pressedButton);
+    waitingForRelease = true;
+  }
+}
+
+
+// Setup
+void setup() {
+  cli();
+
+  DDRD &= ~(1 << DDD2);
+  DDRD |= (1 << DDD3) | (1 << DDD4) | (1 << DDD5) | (1 << DDD6) | (1 << DDD7);
+
+  DDRB &= ~((1 << DDB0) | (1 << DDB1) | (1 << DDB2) | (1 << DDB3));
+
+  PORTB &= ~((1 << PORTB0) | (1 << PORTB1) | (1 << PORTB2) | (1 << PORTB3));
+  PORTD &= ~(1 << PORTD2);
+
+  allLedsOff();
+  speakerLow();
+
+  Serial.begin(9600);
+
+  setupTimer1();
+  setupButtonInterrupt();
+
+  gameStarted = false;
+  startPromptPrinted = false;
+  clearInputState();
+
+  sei();
+}
+
+
+// Main loop
+void loop() {
+  updateSoundSequence();
+
+  if (!gameStarted) {
+    if (!startPromptPrinted) {
+      Serial.println("Click any button to start.");
+      startPromptPrinted = true;
+    }
+
+    bool havePress = false;
+    int8_t pressedButton = -1;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      if (buttonPressPending) {
+        havePress = true;
+        pressedButton = buttonPressed;
+        buttonPressPending = false;
+      }
+    }
+
+    if (havePress && pressedButton >= 0) {
+      ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        buttonStableMask = 0x00;
+      }
+      beginGame();
+    }
+
+    return;
+  }
+
+  if (buttonLedActive && (long)(nowMs() - buttonLedOffTime) >= 0) {
+    allLedsOff();
+    buttonLedActive = false;
+  }
+
+  if (!soundBusy()) {
+    if (pendingLevelAdvance) {
+      pendingLevelAdvance = false;
+      level++;
+      if (level > 10) level = 10;
+
+      Serial.print("Level ");
+      Serial.println(level);
+
+      startShowPattern();
+      return;
+    }
+
+    if (pendingResetToLevel1) {
+      pendingResetToLevel1 = false;
+      level = 1;
+
+      Serial.println("Reset to level 1.");
+
+      startShowPattern();
+      return;
+    }
+  }
+
+  if (showingPattern) {
+    showPatternStep();
+    return;
+  }
+
+  if ((long)(nowMs() - inputDeadline) > 0) {
+    if (!pendingResetToLevel1) {
+      Serial.println("Time out.");
+      playTimeoutSound();
+      pendingResetToLevel1 = true;
+    }
+    return;
+  }
+
+  processButtons();
+}
+
